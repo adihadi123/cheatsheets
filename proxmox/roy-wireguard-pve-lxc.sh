@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Roy / Hermes WireGuard LXC installer for Proxmox VE
 # - Uses the official Community-Scripts WireGuard LXC creator as base
 # - Creates a small unprivileged Debian 13 LXC with /dev/net/tun enabled
-# - Does NOT install WGDashboard by default
+# - Optionally installs WGDashboard (recommended only on internal/VPN access)
 # - Generates wg0.conf and one client config
 #
 # Run on the Proxmox VE host as root:
@@ -19,7 +19,7 @@ WG_CLIENT_DEFAULT="10.99.0.2/32"
 WG_PORT_DEFAULT="51820"
 LAN_ALLOWED_DEFAULT="10.10.10.0/24"
 HOSTNAME_DEFAULT="wireguard"
-BRIDGE_DEFAULT="vmbr0"
+BRIDGE_DEFAULT="vmbr1"
 RAM_DEFAULT="512"
 CPU_DEFAULT="1"
 DISK_DEFAULT="4"
@@ -169,7 +169,6 @@ cat >"/root/wireguard-clients/${client_name}.conf" <<EOF
 [Interface]
 PrivateKey = $client_private
 Address = $client_addr
-DNS = $server_ip_no_cidr
 
 [Peer]
 PublicKey = $server_public
@@ -196,22 +195,78 @@ maybe_configure_host_port_forward() {
   [[ "$enable" == "yes" ]] || return 0
 
   warn "Host-Portforward wird eingerichtet: UDP $public_port -> $ct_ip:$ct_port"
-  warn "Das verändert die Firewall/NAT-Regeln auf dem Proxmox-Host."
+  warn "Das verändert NAT-Regeln auf dem Proxmox-Host."
 
-  if ! command -v nft >/dev/null 2>&1; then
-    err "nft fehlt auf dem Host. Portforward wird übersprungen."
+  if ! command -v iptables >/dev/null 2>&1; then
+    err "iptables fehlt auf dem Host. Portforward wird übersprungen."
     return 1
   fi
 
-  # Runtime nftables DNAT/MASQUERADE. Persistence is deliberately written to a separate include file
-  # and only included if /etc/nftables.conf exists and contains a clear include location.
-  nft list table ip roy_wg_nat >/dev/null 2>&1 || nft add table ip roy_wg_nat
-  nft list chain ip roy_wg_nat prerouting >/dev/null 2>&1 || nft add chain ip roy_wg_nat prerouting '{ type nat hook prerouting priority -100; policy accept; }'
-  nft list chain ip roy_wg_nat postrouting >/dev/null 2>&1 || nft add chain ip roy_wg_nat postrouting '{ type nat hook postrouting priority 100; policy accept; }'
-  nft add rule ip roy_wg_nat prerouting udp dport "$public_port" dnat to "$ct_ip:$ct_port" || true
-  nft add rule ip roy_wg_nat postrouting ip daddr "$ct_ip" udp dport "$ct_port" masquerade || true
+  # Runtime rule for immediate use.
+  iptables -t nat -C PREROUTING -i vmbr0 -p udp --dport "$public_port" -j DNAT --to-destination "$ct_ip:$ct_port" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i vmbr0 -p udp --dport "$public_port" -j DNAT --to-destination "$ct_ip:$ct_port"
 
-  log "Runtime-Portforward aktiv. Prüfe dauerhaftes Speichern manuell, falls deine PVE-Firewall/nftables-Konfiguration anders ist."
+  # Roy's PVE uses /opt/script/network/post-up.sh for persistent vmbr0 NAT/port-forwarding.
+  # Append the rule there when the file exists; otherwise leave a clear runtime-only warning.
+  local post_up="/opt/script/network/post-up.sh"
+  local persist_line="iptables    -t nat      -A PREROUTING   -i vmbr0    -p udp      --dport ${public_port}               -j DNAT     --to ${ct_ip}:${ct_port}"
+  if [[ -f "$post_up" ]]; then
+    if ! grep -Fq -- "--dport ${public_port}" "$post_up"; then
+      cp -a "$post_up" "${post_up}.bak.$(date +%Y%m%d-%H%M%S)"
+      {
+        printf '\n# wireguard lxc %s (added by roy-wireguard-pve-lxc.sh)\n' "$ct_ip"
+        printf '%s\n' "$persist_line"
+      } >>"$post_up"
+      chmod +x "$post_up" || true
+      log "Portforward persistent in $post_up eingetragen."
+    else
+      log "Portforward für UDP $public_port scheint bereits in $post_up vorhanden zu sein."
+    fi
+  else
+    warn "Kein $post_up gefunden; Portforward ist nur runtime aktiv. Bitte persistent nachtragen."
+  fi
+
+  log "Portforward aktiv: UDP $public_port -> $ct_ip:$ct_port"
+}
+
+install_wgdashboard_inside_ct() {
+  local ctid="$1"
+  info "Installiere WGDashboard im LXC $ctid..."
+  pct exec "$ctid" -- bash -lc '
+    set -Eeuo pipefail
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git
+    if [[ ! -d /etc/wgdashboard ]]; then
+      git clone -q https://github.com/WGDashboard/WGDashboard.git /etc/wgdashboard
+    fi
+    cd /etc/wgdashboard/src
+    chmod u+x wgd.sh
+    ./wgd.sh install
+    cat >/etc/systemd/system/wg-dashboard.service <<EOF
+[Unit]
+After=syslog.target network-online.target
+Wants=wg-quick.target
+ConditionPathIsDirectory=/etc/wireguard
+
+[Service]
+Type=forking
+PIDFile=/etc/wgdashboard/src/gunicorn.pid
+WorkingDirectory=/etc/wgdashboard/src
+ExecStart=/etc/wgdashboard/src/wgd.sh start
+ExecStop=/etc/wgdashboard/src/wgd.sh stop
+ExecReload=/etc/wgdashboard/src/wgd.sh restart
+TimeoutSec=120
+PrivateTmp=yes
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now wg-dashboard
+    systemctl --no-pager --full status wg-dashboard | sed -n "1,24p"
+  '
+  log "WGDashboard installiert. Es ist über http://<LXC-IP>:10086 erreichbar. Default Login sofort ändern: admin/admin."
 }
 
 main() {
@@ -226,13 +281,16 @@ main() {
   cat <<'INTRO'
 Roy/Hermes WireGuard-LXC Installer
 
-Das Script nutzt Community-Scripts als Basis, installiert KEIN WGDashboard,
+Das Script nutzt Community-Scripts als Basis, installiert optional WGDashboard,
 erzeugt wg0 und legt eine erste Client-Konfiguration ab.
+
+Roy-PVE-Erkennung: vmbr0 ist extern, vmbr1 ist intern. Daher ist vmbr1 der Default
+für den WireGuard-LXC; der öffentliche UDP-Port wird bei Bedarf von vmbr0 weitergeleitet.
 
 Wichtig: UDP 51820 muss am Ende von außen beim WireGuard-LXC ankommen.
 INTRO
 
-  local ctid hostname bridge ct_ip gateway cpu ram disk wg_endpoint wg_port wg_server wg_client allowed_lans client_name enable_host_forward
+  local ctid hostname bridge ct_ip gateway cpu ram disk wg_endpoint wg_port wg_server wg_client allowed_lans client_name install_dashboard enable_host_forward
   prompt ctid "Container-ID" "$nextid"
   prompt hostname "Hostname" "$HOSTNAME_DEFAULT"
   prompt bridge "Proxmox Bridge" "$BRIDGE_DEFAULT"
@@ -252,7 +310,8 @@ INTRO
   prompt allowed_lans "Netze, die der Client über VPN erreichen soll, Komma-getrennt" "$LAN_ALLOWED_DEFAULT"
   prompt client_name "Name der ersten Client-Konfig" "roy-laptop"
   client_name="$(sanitize_file_name "$client_name")"
-  prompt_yes_no enable_host_forward "UDP-Portforward auf dem PVE-Host automatisch setzen? Nur Ja, wenn LXC keine eigene öffentliche IP hat" "no"
+  prompt_yes_no install_dashboard "WGDashboard installieren? Nur intern/VPN nutzen; Default-Login sofort ändern" "yes"
+  prompt_yes_no enable_host_forward "UDP-Portforward auf dem PVE-Host automatisch setzen? Für Roys vmbr0->vmbr1 Setup normalerweise JA" "yes"
 
   cat <<SUMMARY
 
@@ -264,6 +323,7 @@ Zusammenfassung:
 - Client: $wg_client ($client_name)
 - Client AllowedIPs: $allowed_lans, ${wg_server%%/*}/32
 - Endpoint: $wg_endpoint:$wg_port
+- WGDashboard: $install_dashboard
 - Host-Portforward: $enable_host_forward
 SUMMARY
 
@@ -310,6 +370,10 @@ SUMMARY
   info "Konfiguriere wg0 im LXC..."
   configure_wireguard_inside_ct "$ctid" "$wg_endpoint" "$wg_port" "$wg_server" "$wg_client" "$allowed_lans" "$client_name"
 
+  if [[ "$install_dashboard" == "yes" ]]; then
+    install_wgdashboard_inside_ct "$ctid"
+  fi
+
   if [[ -n "$ct_ipv4" ]]; then
     maybe_configure_host_port_forward "$enable_host_forward" "$wg_port" "$ct_ipv4" "$wg_port" || true
   else
@@ -328,6 +392,7 @@ LXC:
 WireGuard:
 - Server config im LXC: /etc/wireguard/wg0.conf
 - Client config im LXC: /root/wireguard-clients/${client_name}.conf
+- WGDashboard: ${install_dashboard}$( [[ "$install_dashboard" == "yes" ]] && printf ' -> http://%s:10086' "${ct_ipv4:-LXC-IP}" )
 
 Client-Konfig anzeigen:
   pct exec $ctid -- cat /root/wireguard-clients/${client_name}.conf
