@@ -20,6 +20,7 @@ WG_PORT_DEFAULT="51820"
 LAN_ALLOWED_DEFAULT="10.10.10.0/24"
 HOSTNAME_DEFAULT="wireguard"
 BRIDGE_DEFAULT="vmbr1"
+CT_IP_DEFAULT="10.10.10.230/24"
 RAM_DEFAULT="512"
 CPU_DEFAULT="1"
 DISK_DEFAULT="4"
@@ -288,13 +289,15 @@ Roy-PVE-Erkennung: vmbr0 ist extern, vmbr1 ist intern. Daher ist vmbr1 der Defau
 für den WireGuard-LXC; der öffentliche UDP-Port wird bei Bedarf von vmbr0 weitergeleitet.
 
 Wichtig: UDP 51820 muss am Ende von außen beim WireGuard-LXC ankommen.
+WGDashboard wird NICHT direkt öffentlich weitergeleitet. Wenn gewünscht, über Nginx Proxy
+Manager auf dem Proxy-LXC veröffentlichen und dort zusätzlich absichern.
 INTRO
 
   local ctid hostname bridge ct_ip gateway cpu ram disk wg_endpoint wg_port wg_server wg_client allowed_lans client_name install_dashboard enable_host_forward
   prompt ctid "Container-ID" "$nextid"
   prompt hostname "Hostname" "$HOSTNAME_DEFAULT"
   prompt bridge "Proxmox Bridge" "$BRIDGE_DEFAULT"
-  prompt ct_ip "LXC-IP mit CIDR, z.B. 10.10.10.106/24 oder dhcp" "dhcp"
+  prompt ct_ip "LXC-IP mit CIDR, z.B. 10.10.10.230/24 oder dhcp" "$CT_IP_DEFAULT"
   if [[ "$ct_ip" == "dhcp" ]]; then
     gateway=""
   else
@@ -403,6 +406,7 @@ Status prüfen:
 
 Wichtig:
 - UDP $wg_port muss von außen den LXC erreichen.
+- WGDashboard Port 10086 nicht direkt per PVE-Portforward veröffentlichen; bei Bedarf über Nginx Proxy Manager reverse-proxyen und zusätzlich per Access List/Basic Auth/VPN einschränken.
 - Proxmox Web UI / MT5 noVNC danach am besten NICHT öffentlich freigeben, sondern nur über VPN nutzen.
 DONE
 }

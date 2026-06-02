@@ -19,7 +19,7 @@ The installer uses the official Community-Scripts WireGuard LXC script as base, 
 Recommended answers for Roy's setup:
 
 - Bridge: `vmbr1`
-- LXC IP: a free internal IP, e.g. `10.10.10.106/24`
+- LXC IP: `10.10.10.230/24` unless that address is already used
 - Gateway: `10.10.10.1`
 - WireGuard port: `51820`
 - WireGuard server address: `10.99.0.1/24`
@@ -42,9 +42,32 @@ WGDashboard, if installed, is reachable internally at:
 http://<wireguard-lxc-ip>:10086
 ```
 
+For Roy's preferred Nginx Proxy Manager setup, do **not** expose WGDashboard's
+`10086/tcp` directly with a PVE port forward. Keep the only direct PVE forward
+for WireGuard itself:
+
+```text
+Internet UDP 51820 -> PVE vmbr0 -> WireGuard LXC 10.10.10.230:51820/udp
+Internet TCP 80/443 -> NPM/proxy LXC 10.10.10.254 -> WGDashboard 10.10.10.230:10086/tcp
+```
+
+NPM proxy host example:
+
+```text
+Domain: wgdashboard.<your-domain>
+Scheme: http
+Forward Hostname/IP: 10.10.10.230
+Forward Port: 10086
+Block Common Exploits: enabled
+SSL: Let's Encrypt
+Force SSL: enabled
+Access List: Basic Auth and/or allow only VPN/internal source ranges
+```
+
 Security notes:
 
 - Change WGDashboard's default login immediately.
 - Only expose the WireGuard UDP port, usually `51820/udp`.
+- Do not expose WGDashboard `10086/tcp` directly from PVE; publish it through NPM only if you add NPM access controls.
 - Do not expose Proxmox `8006` or MT5/noVNC `6080` publicly.
 - Review the script before running it as root.
